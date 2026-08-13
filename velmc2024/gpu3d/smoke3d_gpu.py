@@ -81,13 +81,19 @@ def make_interpolator(grid: torch.Tensor, L: float):
     """返回 f(points (M,3) 物理坐标) -> (M,C) 三线性插值。
 
     grid: (C, nz, ny, nx)；物理域 [-L/2, L/2]³。
+    align_corners=True 要求归一化坐标 (2i-(n-1))/(n-1) 才精确落在像素 i，
+    而网格点物理坐标对应 (2i-(n-1))/n，故需乘 n/(n-1) 修正，否则每步插值
+    有 ~0.5 像素偏移，平流会持续耗散场量。
     """
     C = grid.shape[0]
+    nz, ny, nx = grid.shape[1], grid.shape[2], grid.shape[3]
     g = grid.unsqueeze(0)  # (1, C, D, H, W)
+    scale = torch.tensor([nx / (nx - 1.0), ny / (ny - 1.0), nz / (nz - 1.0)],
+                         dtype=grid.dtype, device=grid.device)  # (x, y, z)
 
     def f(points: torch.Tensor) -> torch.Tensor:
         M = points.shape[0]
-        coords = points * (2.0 / L)  # [-L/2,L/2] -> [-1,1]，顺序 (x,y,z)
+        coords = points * (2.0 / L) * scale  # [-L/2,L/2] -> [-1,1]，顺序 (x,y,z)
         flow = coords.reshape(1, 1, 1, M, 3)  # (N, D_out, H_out, W_out, 3)
         out = F.grid_sample(g, flow, mode="bilinear", align_corners=True,
                             padding_mode="border")
@@ -109,20 +115,22 @@ def project_batch(points: torch.Tensor, u_field, box: Box3D,
     R_p = box.max_corner_distance(points)      # (P,)
 
     # ---------------- 体积项 ---------------- #
-    ur = torch.rand((P, nvol), device=device, generator=generator)
+    n_draw = max(1, nvol // 2) if antithetic else max(1, nvol)
+    ur = torch.rand((P, n_draw), device=device, generator=generator)
     r = R_p[:, None] * torch.sqrt(ur)
-    z = torch.rand((P, nvol), device=device, generator=generator) * 2.0 - 1.0
-    phi = torch.rand((P, nvol), device=device, generator=generator) * (2.0 * math.pi)
+    z = torch.rand((P, n_draw), device=device, generator=generator) * 2.0 - 1.0
+    phi = torch.rand((P, n_draw), device=device, generator=generator) * (2.0 * math.pi)
     s = torch.sqrt(torch.clamp(1.0 - z * z, min=0.0))
     direction = torch.stack([s * torch.cos(phi), s * torch.sin(phi), z], dim=-1)
-    r_vec = direction * r[..., None]           # (P,S,3)
+    r_vec = direction * r[..., None]           # (P,n_draw,3)
     inv_pdf = (2.0 * math.pi) * (R_p[:, None] ** 2) * r
     if antithetic:
         r_vec = torch.cat([r_vec, -r_vec], dim=1)
         inv_pdf = torch.cat([inv_pdf, inv_pdf], dim=1)
-        S = 2 * nvol
+        S = 2 * n_draw
     else:
-        S = nvol
+        S = n_draw
+    n_eff = max(nvol, 1)
 
     y = points[:, None, :] + r_vec             # (P,S,3)
     vel_y = u_field(y.reshape(-1, 3)).reshape(P, S, 3)
@@ -133,7 +141,7 @@ def project_batch(points: torch.Tensor, u_field, box: Box3D,
     dot_ru = (r_hat * vel_diff).sum(dim=-1)
     kernel = 3.0 * dot_ru[..., None] * r_hat - vel_diff
     contrib = in_box[..., None] * (R_p[:, None] ** 2 / (2.0 * rr * rr))[..., None] * kernel
-    ev = contrib.sum(dim=1) / nvol             # (P,3)
+    ev = contrib.sum(dim=1) / n_eff             # (P,3)
 
     # ---------------- 伪边界项 ---------------- #
     ea = torch.zeros_like(u_x)
@@ -200,7 +208,8 @@ class SmokeSolverGPU:
                  concentration_rate=2.0, temperature_rate=3.0,
                  buoyancy_beta=1.0, gravity=(0.0, -1.0, 0.0),
                  sg_v=0.36, sg_c=0.11, sg_t=0.11,
-                 projection_relax=1.0,
+                 projection_relax=0.15,
+                 umax_clamp=1.5,
                  smoke_center=(0.0, -1.25, 0.0), smoke_half=(0.125, 0.125, 0.125),
                  chunk=4096, seed=0, verbose=True):
         self.nx = self.ny = self.nz = int(grid_res)
@@ -213,6 +222,7 @@ class SmokeSolverGPU:
         self.buoyancy_beta = float(buoyancy_beta)
         self.sg_v, self.sg_c, self.sg_t = float(sg_v), float(sg_c), float(sg_t)
         self.relax = float(projection_relax)
+        self.umax_clamp = float(umax_clamp)
         self.chunk = int(chunk)
         self.verbose = verbose
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -258,10 +268,10 @@ class SmokeSolverGPU:
                                 torch.tensor(1.0, device=c.device))
         T[0][m] = T[0][m] + (1.0 - math.exp(-self.temperature_rate * self.dt)) * (1.0 - T[0][m])
 
-    def _apply_buoyancy(self, u):
-        # u: (3, nz, ny, nx)；浮力 accel = -β·T·gravity
+    def _apply_buoyancy(self, u, T):
+        # u: (3, nz, ny, nx)；T: (nz, ny, nx)；浮力 accel = -β·T·gravity
         g = (-self.gravity).view(3, 1, 1, 1)
-        accel = self.buoyancy_beta * self.T[0].unsqueeze(0) * g  # (3, nz, ny, nx)
+        accel = self.buoyancy_beta * T.unsqueeze(0) * g  # (3, nz, ny, nx)
         u += self.dt * accel
 
     def _project(self):
@@ -299,7 +309,7 @@ class SmokeSolverGPU:
 
         # 源 + 浮力
         self._apply_source(c_new, T_new)
-        self._apply_buoyancy(u_new)
+        self._apply_buoyancy(u_new, T_new[0])
 
         # 扩散
         if self.sg_v > 0:
@@ -312,11 +322,21 @@ class SmokeSolverGPU:
         # 投影
         self.u.copy_(u_new)
         self._project()
+        # 速度钳制（防浮力反馈发散）：按模长等比缩放到上限，保持方向
+        if self.umax_clamp > 0:
+            self._clamp_velocity()
         self.c.copy_(c_new)
         self.T.copy_(T_new)
 
         self.step_count += 1
         self.time += dt
+
+    def _clamp_velocity(self):
+        mag = self.u.norm(dim=0, keepdim=True)          # (1, nz, ny, nx)
+        if float(mag.max()) <= self.umax_clamp:
+            return
+        scale = (self.umax_clamp / mag.clamp(min=1e-12)).clamp(max=1.0)
+        self.u.mul_(scale)
 
     def run(self, n_steps, save_every=0, out_dir=None):
         import os

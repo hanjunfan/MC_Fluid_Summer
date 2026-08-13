@@ -17,3 +17,7 @@ Thumbs.db
 
 # Jupyter
 .ipynb_checkpoints/
+
+# 运行结果数据（保留 GIF，忽略中间帧和数据）
+results/**/conc_*.npy
+results/**/frame_*.png
