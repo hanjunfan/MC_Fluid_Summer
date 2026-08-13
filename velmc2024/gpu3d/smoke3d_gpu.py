@@ -39,6 +39,28 @@ class Box3D:
         return torch.sqrt(((self.h + pts.abs()) ** 2).sum(dim=-1))
 
 
+class Sphere3D:
+    """球体障碍物（论文浮力烟场景：烟柱上升撞球绕流）。"""
+
+    def __init__(self, center, radius: float):
+        self.center = torch.as_tensor(center, dtype=torch.float32)
+        self.radius = float(radius)
+        self.area = 4.0 * math.pi * self.radius * self.radius
+
+    def to(self, device):
+        self.center = self.center.to(device)
+        return self
+
+    def sample_surface(self, n: int, device, generator):
+        """球面均匀采样，返回 (pts (n,3), outward_normals (n,3))。"""
+        z = torch.rand(n, device=device, generator=generator) * 2.0 - 1.0
+        phi = torch.rand(n, device=device, generator=generator) * (2.0 * math.pi)
+        s = torch.sqrt(torch.clamp(1.0 - z * z, min=0.0))
+        d = torch.stack([s * torch.cos(phi), s * torch.sin(phi), z], dim=-1)
+        pts = self.center.to(device) + self.radius * d
+        return pts, d
+
+
 def sample_box_boundary(n: int, box: Box3D, device, generator):
     """盒 6 面均匀采样，返回 (pts (n,3), outward_normals (n,3))。"""
     h = box.h
@@ -107,8 +129,12 @@ def make_interpolator(grid: torch.Tensor, L: float):
 # --------------------------------------------------------------------------- #
 def project_batch(points: torch.Tensor, u_field, box: Box3D,
                   nvol: int, npsb: int, generator,
+                  spheres=None, nsph: int = 200,
                   antithetic: bool = True, relax: float = 1.0) -> torch.Tensor:
-    """对 points (P,3) 批量投影，返回投影后速度 (P,3)。"""
+    """对 points (P,3) 批量投影，返回投影后速度 (P,3)。
+
+    spheres: Sphere3D 列表；球体边界项（WoB 无穿透，速度平移消奇异）。
+    """
     P = points.shape[0]
     device = points.device
     u_x = u_field(points)                      # (P,3)
@@ -155,7 +181,20 @@ def project_batch(points: torch.Tensor, u_field, box: Box3D,
         g = r_vec_all / (4.0 * math.pi * (r_all ** 3))[..., None]
         ea = (box.area / npsb) * (ndot[..., None] * g).sum(dim=1)
 
-    pressure_grad = -relax * (ev + ea)
+    # ---------------- 球体障碍边界项（WoB 无穿透） ---------------- #
+    es = torch.zeros_like(u_x)
+    if spheres:
+        for sphere in spheres:
+            spts, snorms = sphere.sample_surface(nsph, device, generator)
+            vel_s = u_field(spts)                              # (N,3) 球面速度
+            ndot = (snorms * vel_s).sum(-1)                    # (N,) n·u(y)
+            r_vec_all = spts[None, :, :] - points[:, None, :]  # (P,N,3)
+            r_all = r_vec_all.norm(dim=-1).clamp(min=1e-5)
+            g = r_vec_all / (4.0 * math.pi * (r_all ** 3))[..., None]
+            es = es + (sphere.area / nsph) * (ndot[None, :, None] * g).sum(dim=1)
+
+    # 球体边界项（无穿透硬约束）不乘 relax，完整施加；体积/伪边界项仍用 relax 阻尼噪声
+    pressure_grad = -relax * (ev + ea) - es
     return u_x - pressure_grad
 
 
@@ -211,6 +250,7 @@ class SmokeSolverGPU:
                  projection_relax=0.15,
                  umax_clamp=1.5,
                  smoke_center=(0.0, -1.25, 0.0), smoke_half=(0.125, 0.125, 0.125),
+                 spheres=None, nsph=200,
                  chunk=4096, seed=0, verbose=True):
         self.nx = self.ny = self.nz = int(grid_res)
         self.L = float(domain_size)
@@ -229,6 +269,8 @@ class SmokeSolverGPU:
         self.gravity = torch.tensor(gravity, dtype=torch.float32, device=self.device)
         self.smoke_center = torch.tensor(smoke_center, dtype=torch.float32, device=self.device)
         self.smoke_half = torch.tensor(smoke_half, dtype=torch.float32, device=self.device)
+        self.nsph = int(nsph)
+        self.spheres = [s.to(self.device) for s in (spheres or [])]
         self.generator = torch.Generator(device=self.device).manual_seed(seed)
 
         self.box = Box3D(self.L)
@@ -282,7 +324,8 @@ class SmokeSolverGPU:
         for s in range(0, n, self.chunk):
             sub = pts[s:s + self.chunk]
             proj = project_batch(sub, self.u_field, self.box, self.nvol, self.npsb,
-                                 self.generator, relax=self.relax)
+                                 self.generator, spheres=self.spheres, nsph=self.nsph,
+                                 relax=self.relax)
             # proj (P,3) -> 写回 (3, nz, ny, nx) 对应位置
             idx = torch.arange(s, s + sub.shape[0], device=self.device)
             iz = idx // (self.ny * self.nx)
@@ -328,6 +371,9 @@ class SmokeSolverGPU:
         self.c.copy_(c_new)
         self.T.copy_(T_new)
 
+        # 球体内部（固体）硬约束：清零速度/浓度/温度，杜绝穿透
+        self._zero_sphere_interior()
+
         self.step_count += 1
         self.time += dt
 
@@ -337,6 +383,20 @@ class SmokeSolverGPU:
             return
         scale = (self.umax_clamp / mag.clamp(min=1e-12)).clamp(max=1.0)
         self.u.mul_(scale)
+
+    def _zero_sphere_interior(self):
+        """球体内部（静止固体）硬约束：速度与标量场清零，杜绝烟穿透。"""
+        if not self.spheres:
+            return
+        pts = self._grid_pts
+        mask = torch.zeros(pts.shape[0], dtype=torch.bool, device=self.device)
+        for sphere in self.spheres:
+            d = (pts - sphere.center.to(self.device)).norm(dim=-1)
+            mask = mask | (d < sphere.radius)
+        m3 = mask.reshape(self.nz, self.ny, self.nx)
+        self.u[:, m3] = 0.0
+        self.c[:, m3] = 0.0
+        self.T[:, m3] = 0.0
 
     def run(self, n_steps, save_every=0, out_dir=None):
         import os

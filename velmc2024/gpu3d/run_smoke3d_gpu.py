@@ -20,14 +20,16 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.patches import Circle
 
 plt.rcParams["font.sans-serif"] = ["DejaVu Sans", "SimHei"]
 plt.rcParams["axes.unicode_minus"] = False
 
-from velmc2024.gpu3d.smoke3d_gpu import SmokeSolverGPU  # noqa: E402
+from velmc2024.gpu3d.smoke3d_gpu import SmokeSolverGPU, Sphere3D  # noqa: E402
 
 
-def render_frame(q: np.ndarray, L: float, path: Path, t: float, crop: float = 0.75):
+def render_frame(q: np.ndarray, L: float, path: Path, t: float, crop: float = 0.75,
+                 sphere=None):
     """渲染浓度场三个正交切片。q shape (nz, ny, nx)=(z,y,x)，y 为垂直方向。
 
     烟柱在 x、z 方向很窄，裁剪到 [-crop, crop] 聚焦烟柱；y 方向保留全范围看上升。
@@ -70,6 +72,15 @@ def render_frame(q: np.ndarray, L: float, path: Path, t: float, crop: float = 0.
     axes[2].set_title("俯视 (y=0)")
     axes[2].set_xlabel("x"); axes[2].set_ylabel("z")
 
+    # 画球体障碍物（三个切片里的投影圆）
+    if sphere is not None:
+        cx, cy, cz = sphere.center.cpu().numpy()
+        R = sphere.radius
+        edge = dict(facecolor="none", edgecolor="white", linewidth=2)
+        axes[0].add_patch(Circle((cx, cy), R, **edge))   # 侧面 xy
+        axes[1].add_patch(Circle((cy, cz), R, **edge))   # 正面 yz
+        axes[2].add_patch(Circle((cx, cz), R, **edge))   # 俯视 xz
+
     fig.suptitle(f"3D 浮力烟 (GPU)  t={t:.2f}")
     fig.colorbar(im, ax=axes, shrink=0.7, label="浓度")
     fig.savefig(path, dpi=130)
@@ -85,13 +96,21 @@ def main():
     ap.add_argument("--beta", type=float, default=4.0, help="浮力强度（补偿平流耗散，4 能升到顶）")
     ap.add_argument("--relax", type=float, default=0.15, help="投影松弛（≤1，越小越稳）")
     ap.add_argument("--umax", type=float, default=1.5, help="速度钳制上限（防发散，0=关闭）")
+    ap.add_argument("--sphere", type=float, default=0.0,
+                    help="球体障碍物半径（0=无球体；论文场景如 0.3，位于烟柱上方 (0,0,0)）")
+    ap.add_argument("--sphere-y", type=float, default=0.0, help="球体中心 y 坐标")
+    ap.add_argument("--nsph", type=int, default=200, help="球面边界项采样数")
     ap.add_argument("--out", type=str, default="results/smoke3d_gpu")
     args = ap.parse_args()
+
+    spheres = None
+    if args.sphere > 0:
+        spheres = [Sphere3D((0.0, args.sphere_y, 0.0), args.sphere)]
 
     solver = SmokeSolverGPU(
         grid_res=args.grid, nvol=args.nvol, npsb=args.npsb,
         buoyancy_beta=args.beta, projection_relax=args.relax,
-        umax_clamp=args.umax,
+        umax_clamp=args.umax, spheres=spheres, nsph=args.nsph,
     )
 
     out_dir = Path(args.out)
@@ -104,10 +123,12 @@ def main():
 
     print("渲染 PNG 帧...")
     L = solver.L
+    sphere = solver.spheres[0] if solver.spheres else None
     for p in sorted(out_dir.glob("conc_*.npy")):
         q = np.load(p)
         step = int(p.stem.split("_")[1])
-        render_frame(q, L, out_dir / f"frame_{step:05d}.png", step * solver.dt)
+        render_frame(q, L, out_dir / f"frame_{step:05d}.png", step * solver.dt,
+                     sphere=sphere)
     print(f"完成，帧图在 {out_dir}")
 
 
